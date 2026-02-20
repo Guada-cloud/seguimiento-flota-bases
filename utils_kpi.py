@@ -1,171 +1,233 @@
-# utils_kpi.py — funciones de transformación y KPIs (es-AR) con dimensión Base
+# utils_ops.py — utilidades de datos y métricas (Plan vs Real)
 from __future__ import annotations
 import pandas as pd
 import numpy as np
-from datetime import datetime
-from typing import List, Optional
+from io import BytesIO
+from pathlib import Path
 
-BLOQUES_VALIDOS = ["CABA","PLAT","N1","N2","N3","O1","S1","S2"]
-FRANJAS = ["00-05","07-19","20-23"]
-BASES_VALIDAS = ["PROY_6001","PROY_MECA","PROY_10541","PROY_13305","DEMOTOS"]
+# ==========================
+# 1) Mapeo y normalización
+# ==========================
+EXPECTED_PLAN = {
+    "Fecha": ["fecha", "date", "dia", "día"],
+    "Hora":  ["hora", "time"],
+    "Base":  ["base", "sede", "plataforma"],
+    "Moviles_Planificados":  ["moviles_planificados","moviles_plan","mov_plan","mov_planif"],
+    "Servicios_Planificados":["servicios_planificados","serv_plan","svc_plan","llamadas_plan"]
+}
+EXPECTED_REAL = {
+    "Fecha": ["fecha","date","dia","día"],
+    "Hora":  ["hora","time"],
+    "Base":  ["base","sede","plataforma"],
+    "Moviles_Reales":  ["moviles_reales","mov_real","mov_obs","moviles_obs"],
+    "Servicios_Reales":["servicios_reales","svc_real","llamadas_real","llamadas_reales"]
+}
 
-# === Equivalente a WEEKNUM(fecha,2) (Sistema 1; semana inicia Lunes) ===
-def weeknum_excel_system1_monday(dt: pd.Timestamp) -> int:
-    year = dt.year
-    jan1 = pd.Timestamp(year,1,1)
-    start_week1 = jan1 - pd.Timedelta(days=jan1.weekday())
-    delta_days = (dt.normalize() - start_week1.normalize()).days
-    return 1 if delta_days < 0 else int(delta_days // 7) + 1
+def _guess_map(df: pd.DataFrame, expected: dict[str, list[str]]) -> dict[str, str]:
+    """Sugerir mapeo por coincidencia insensible a mayúsculas y acentos simples."""
+    def norm(s: str) -> str:
+        tr = str(s).strip().lower()
+        tr = (tr.replace("á","a").replace("é","e").replace("í","i")
+                .replace("ó","o").replace("ú","u").replace("ñ","n"))
+        return tr
+    cols = {norm(c): c for c in df.columns}
+    m = {}
+    for target, aliases in expected.items():
+        hit = None
+        for a in aliases+[target]:
+            na = norm(a)
+            if na in cols:
+                hit = cols[na]; break
+        m[target] = hit if hit else ""
+    return m
 
-def asignar_franja(hora) -> str:
-    if isinstance(hora, str):
+def apply_map(df: pd.DataFrame, mapping: dict[str,str], kind: str) -> pd.DataFrame:
+    """Renombra columnas usando mapping y devuelve un DataFrame con sólo las esperadas."""
+    if kind=="plan":
+        want = ["Fecha","Hora","Base","Moviles_Planificados","Servicios_Planificados"]
+    else:
+        want = ["Fecha","Hora","Base","Moviles_Reales","Servicios_Reales"]
+    # validar que mapping está completo
+    miss = [k for k,v in mapping.items() if k in want and not v]
+    if miss:
+        raise ValueError(f"Faltan columnas en el mapeo: {', '.join(miss)}")
+    df2 = df.rename(columns=mapping)[want].copy()
+    return df2
+
+def enrich_time(df: pd.DataFrame) -> pd.DataFrame:
+    """Convierte Fecha/Hora, crea Año, Mes, Semana_ISO, Día_nombre, Hora_str."""
+    out = df.copy()
+    out["Fecha"] = pd.to_datetime(out["Fecha"], errors="coerce").dt.date
+    # Hora puede venir como texto "HH:MM", time o número Excel
+    if np.issubdtype(pd.Series(out["Hora"]).dtype, np.number):
+        # fracción de día → HH:MM
+        out["Hora"] = pd.to_timedelta((out["Hora"]%1)*24, unit="h")
+        out["Hora"] = (pd.Timestamp("1900-01-01")+out["Hora"]).dt.time
+    else:
+        out["Hora"] = pd.to_datetime(out["Hora"].astype(str), errors="coerce").dt.time
+    out["Fecha_dt"] = pd.to_datetime(out["Fecha"])
+    iso = out["Fecha_dt"].dt.isocalendar()
+    out["Año"]   = out["Fecha_dt"].dt.year
+    out["Mes"]   = out["Fecha_dt"].dt.month
+    out["Semana"] = iso.week             # Semana ISO
+    out["Dia"]   = out["Fecha_dt"].dt.day
+    out["DiaNombre"] = out["Fecha_dt"].dt.day_name(locale="es_ES")
+    out["HoraStr"]   = pd.to_datetime(out["Hora"].astype(str)).dt.strftime("%H:%M")
+    return out
+
+# ==========================
+# 2) Merge y clasificación
+# ==========================
+def merge_plan_real(plan: pd.DataFrame, real: pd.DataFrame) -> pd.DataFrame:
+    """Merge outer por Fecha+Hora+Base y clasifica match vs no-match."""
+    keys = ["Fecha","Hora","Base"]
+    merged = pd.merge(
+        plan, real, on=keys, how="outer", suffixes=("_Plan","_Real"), indicator=True
+    )
+    # flags
+    merged["Status"] = np.select(
+        [
+            merged["_merge"].eq("left_only"),
+            merged["_merge"].eq("right_only"),
+            merged["_merge"].eq("both"),
+        ],
+        [
+            "No ejecutado",   # hay plan, no hay real
+            "No planificado", # hay real, no hay plan
+            "OK"
+        ],
+        default="Desconocido"
+    )
+    merged.drop(columns=["_merge"], inplace=True)
+    return merged
+
+def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    """Calcula diferencias, % desvío, clasificación, efectividad y errores."""
+    out = df.copy()
+
+    # Rellenos 0 donde corresponda (sin romper división)
+    for c in ["Moviles_Planificados","Servicios_Planificados","Moviles_Reales","Servicios_Reales"]:
+        if c not in out:
+            out[c] = 0
+    out[["Moviles_Planificados","Servicios_Planificados",
+         "Moviles_Reales","Servicios_Reales"]] = out[[
+            "Moviles_Planificados","Servicios_Planificados",
+            "Moviles_Reales","Servicios_Reales"
+         ]].fillna(0)
+
+    # Diffs
+    out["Dif_Moviles"]   = out["Moviles_Reales"]   - out["Moviles_Planificados"]
+    out["Dif_Servicios"] = out["Servicios_Reales"] - out["Servicios_Planificados"]
+
+    # Desvíos % (controlando división por 0)
+    out["Desvio_Moviles_%"]   = np.where(out["Moviles_Planificados"]>0,
+                                         out["Dif_Moviles"]/out["Moviles_Planificados"]*100, np.nan)
+    out["Desvio_Servicios_%"] = np.where(out["Servicios_Planificados"]>0,
+                                         out["Dif_Servicios"]/out["Servicios_Planificados"]*100, np.nan)
+
+    # Clasificación (según Dif_Servicios; podés cambiar a Dif_Moviles si preferís)
+    out["Clasificacion"] = np.select(
+        [
+            out["Status"].eq("No ejecutado"),
+            out["Status"].eq("No planificado"),
+            out["Dif_Servicios"].eq(0),
+            out["Dif_Servicios"]>0,
+            out["Dif_Servicios"]<0
+        ],
+        [
+            "No ejecutado","No planificado","Exacto","Sobre planificado","Bajo planificado"
+        ], default="NA"
+    )
+
+    # Efectividad (sobre Servicios)
+    out["Efectividad"] = np.where(out["Servicios_Planificados"]>0,
+                                  1 - (out["Dif_Servicios"].abs()/out["Servicios_Planificados"]), np.nan)
+
+    # Errores agregados (sobre Servicios)
+    out["APE"]  = np.where(out["Servicios_Planificados"]>0,
+                           (out["Servicios_Reales"] - out["Servicios_Planificados"]).abs()/out["Servicios_Planificados"], np.nan)  # abs perc error
+    out["AE"]   = (out["Servicios_Reales"] - out["Servicios_Planificados"]).abs()
+    out["Bias"] = (out["Servicios_Planificados"] - out["Servicios_Reales"])  # +: sobreplan
+
+    return out
+
+def agg_error_metrics(df: pd.DataFrame) -> dict:
+    """MAPE, MAE, Forecast Bias% (sobre Servicios)."""
+    d = df.copy()
+    # MAPE (%)
+    mape = np.nan
+    if (d["APE"].notna()).any():
+        mape = d["APE"].mean()*100
+    # MAE
+    mae = d["AE"].mean() if (d["AE"].notna()).any() else np.nan
+    # Forecast Bias % = sum(Plan-Real)/sum(Real) * 100
+    fbias = np.nan
+    if d["Servicios_Reales"].sum() != 0:
+        fbias = (d["Bias"].sum()/d["Servicios_Reales"].sum())*100
+    return {"MAPE_%":mape, "MAE":mae, "ForecastBias_%":fbias}
+
+# ==========================
+# 3) Filtros y top‑N
+# ==========================
+def add_time_keys(df: pd.DataFrame) -> pd.DataFrame:
+    """Asegura Año/Mes/Semana/Dia/HoraStr para filtros y gráficos."""
+    if "Fecha_dt" not in df.columns:
+        df["Fecha_dt"] = pd.to_datetime(df["Fecha"])
+    iso = df["Fecha_dt"].dt.isocalendar()
+    df["Año"] = df["Fecha_dt"].dt.year
+    df["Mes"] = df["Fecha_dt"].dt.month
+    df["Semana"] = iso.week
+    df["Dia"] = df["Fecha_dt"].dt.day
+    df["HoraStr"] = pd.to_datetime(df["Hora"].astype(str)).dt.strftime("%H:%M")
+    return df
+
+def filter_df(df: pd.DataFrame, bases: list[str]|None=None,
+              fecha: pd.Timestamp|None=None, semana:int|None=None,
+              mes: str|None=None, hora_sel:list[str]|None=None) -> pd.DataFrame:
+    d = df.copy()
+    if bases: d = d[d["Base"].isin(bases)]
+    if fecha is not None: d = d[d["Fecha"].eq(pd.to_datetime(fecha).date())]
+    if semana: d = d[d["Semana"].eq(int(semana))]
+    if mes:
         try:
-            h = int(hora.split(":")[0])
+            aa, mm = mes.split("-"); aa=int(aa); mm=int(mm)
+            d = d[(d["Año"].eq(aa)) & (d["Mes"].eq(mm))]
         except Exception:
-            return ""
-    elif isinstance(hora, pd.Timestamp):
-        h = hora.hour
-    elif isinstance(hora, pd.Timedelta):
-        h = (datetime.min + hora).hour
-    else:
-        return ""
-    if 7 <= h < 20:   return "07-19"
-    elif 20 <= h <= 23: return "20-23"
-    else:               return "00-05"
+            pass
+    if hora_sel: d = d[d["HoraStr"].isin(hora_sel)]
+    return d
 
-def _coerce_time_col(s: pd.Series) -> pd.Series:
-    if np.issubdtype(s.dtype, np.number):
-        return pd.to_timedelta((s % 1) * 24, unit='h')
-    def parse_h(x):
-        if pd.isna(x): return pd.NaT
-        if isinstance(x, (pd.Timestamp, pd.Timedelta)): return x
-        try:
-            hh, mm = str(x).split(":")[:2]
-            return pd.to_timedelta(int(hh), 'h') + pd.to_timedelta(int(mm), 'm')
-        except Exception:
-            return pd.NaT
-    return s.map(parse_h)
+def top5_hours(df: pd.DataFrame):
+    """Top 5 horas sub‑plan (negativo) y sobre‑plan (positivo) por magnitud en Dif_Servicios."""
+    g = df.groupby("HoraStr", as_index=False)["Dif_Servicios"].sum()
+    sub = g.nsmallest(5, "Dif_Servicios")   # más negativo
+    sobre = g.nlargest(5, "Dif_Servicios")  # más positivo
+    return sub, sobre
 
-def _infer_base_from_sheet(sheet_name: str) -> str:
-    name = sheet_name.strip().upper()
-    for b in BASES_VALIDAS:
-        if b in name: return b
-    return name.replace(" ", "_")[:20]
+def worst_base(df: pd.DataFrame):
+    """Base con mayor desvío acumulado (|Dif_Servicios|)."""
+    g = df.groupby("Base", as_index=False)["Dif_Servicios"].sum()
+    g_abs = df.groupby("Base", as_index=False)["Dif_Servicios"].apply(lambda s: s.abs().sum()).rename(columns={"Dif_Servicios":"AbsDesvio"})
+    out = g.merge(g_abs, on="Base", how="left").sort_values("AbsDesvio", ascending=False)
+    return out.head(1)
 
-def normalizar_entrada(df: pd.DataFrame, sheet_name: Optional[str]=None) -> pd.DataFrame:
-    def col_like(dfc, *names):
-        for n in names:
-            for c in dfc.columns:
-                if c.strip().lower() == n.lower(): return c
-        return None
+# ==========================
+# 4) Persistencia CSV + export
+# ==========================
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
+PLAN_CSV = DATA_DIR/"plan.csv"
+REAL_CSV = DATA_DIR/"real.csv"
+MERG_CSV = DATA_DIR/"merged.csv"
 
-    c_fecha = col_like(df, "fecha","date")
-    c_hora  = col_like(df, "hora","time")
-    c_bloq  = col_like(df, "bloque","zona","bloque/zona","block")
-    c_proy  = col_like(df, "proy","proyectado","svc proy","proyectados","proyeccion","proyección")
-    c_real  = col_like(df, "real","reales","svc reales","observado","observados")
-    c_base  = col_like(df, "base","plataforma","sistema")
+def save_csv(df: pd.DataFrame, path: Path): df.to_csv(path, index=False, encoding="utf-8")
+def load_csv(path: Path) -> pd.DataFrame|None:
+    return pd.read_csv(path, encoding="utf-8") if path.exists() else None
 
-    required = [c_fecha,c_hora,c_bloq,c_proy,c_real]
-    if any(x is None for x in required):
-        faltan = [n for n,x in zip(['Fecha','Hora','Bloque','Proy','Real'], required) if x is None]
-        raise ValueError(f"Faltan columnas obligatorias: {', '.join(faltan)}")
-
-    out = df[[c_fecha,c_hora,c_bloq,c_proy,c_real]].copy()
-    out.columns = ['Fecha','Hora','Bloque','Proy','Real']
-    out['Fecha'] = pd.to_datetime(out['Fecha'], errors='coerce').dt.date
-    out['Hora']  = _coerce_time_col(out['Hora'])
-
-    out['Bloque'] = out['Bloque'].astype(str).str.strip().str.upper()
-    out = out[out['Bloque'].isin(BLOQUES_VALIDOS)]
-    out['Proy'] = pd.to_numeric(out['Proy'], errors='coerce')
-    out['Real'] = pd.to_numeric(out['Real'], errors='coerce')
-
-    # Base
-    if c_base is not None:
-        out['Base'] = df[c_base].astype(str).str.strip().str.upper()
-    else:
-        out['Base'] = _infer_base_from_sheet(sheet_name or 'SIN_BASE')
-
-    # Derivados
-    out['Semana'] = [weeknum_excel_system1_monday(pd.Timestamp(f)) if pd.notna(f) else np.nan for f in out['Fecha']]
-    out['Día']    = [pd.Timestamp(f).strftime('%A') if pd.notna(f) else '' for f in out['Fecha']]
-    out['Franja'] = out['Hora'].map(asignar_franja)
-    out['Sesgo']  = out['Proy'] - out['Real']
-    out['ErrorAbs'] = out['Sesgo'].abs()
-    out['Precisión_fila'] = np.where(out['Real']>0, 1 - out['ErrorAbs']/out['Real'], np.nan)
-
-    return out.dropna(subset=['Fecha','Hora'])
-
-def kpis_dia(df: pd.DataFrame, fecha, bases: List[str], bloque: Optional[str], franja: Optional[str]):
-    d = df[df['Fecha']==fecha]
-    if bases: d = d[d['Base'].isin(bases)]
-    if bloque and bloque!="Todos": d = d[d['Bloque']==bloque]
-    if franja and franja!="Todos": d = d[d['Franja']==franja]
-
-    by_hour = d.groupby(['Hora','Base'], as_index=False).agg(Proy=('Proy','sum'), Real=('Real','sum'))
-    by_hour['ErrorAbs'] = (by_hour['Proy']-by_hour['Real']).abs()
-
-    agg_total = by_hour.groupby('Base', as_index=False).agg(Proy=('Proy','sum'), Real=('Real','sum'), ErrorAbs=('ErrorAbs','sum'))
-    agg_total['Precisión'] = np.where(agg_total['Real']>0, 1-agg_total['ErrorAbs']/agg_total['Real'], np.nan)
-
-    t_proy, t_real, t_err = agg_total['Proy'].sum(), agg_total['Real'].sum(), agg_total['ErrorAbs'].sum()
-    precision = (1 - t_err/t_real) if t_real>0 else np.nan
-    wape = (t_err/t_real) if t_real>0 else np.nan
-    sesgo = t_proy - t_real
-    return by_hour, agg_total, precision, wape, sesgo
-
-def kpis_semanal(df: pd.DataFrame, anio:int, mes:int, semana:int, bases: List[str], bloque: Optional[str], franja: Optional[str]):
-    d = df[(pd.Series([f.year for f in df['Fecha']])==anio) & (pd.Series([f.month for f in df['Fecha']])==mes)]
-    if bases: d = d[d['Base'].isin(bases)]
-    if bloque and bloque!="Todos": d = d[d['Bloque']==bloque]
-    if franja and franja!="Todos": d = d[d['Franja']==franja]
-
-    g = d.groupby(['Semana','Base'], as_index=False).agg(Proy=('Proy','sum'), Real=('Real','sum'))
-    g['ErrorAbs'] = (g['Proy']-g['Real']).abs()
-    g['Precisión'] = np.where(g['Real']>0, 1-g['ErrorAbs']/g['Real'], np.nan)
-    g['WAPE'] = np.where(g['Real']>0, g['ErrorAbs']/g['Real'], np.nan)
-
-    sems = sorted(g['Semana'].dropna().unique().tolist())
-    if semana and semana in sems:
-        idx = sems.index(semana); sems = sems[idx:idx+6]
-    else:
-        sems = sems[:6]
-    g = g[g['Semana'].isin(sems)].sort_values(['Base','Semana'])
-    g['Precisión_sem_ant'] = g.groupby('Base')['Precisión'].shift(1)
-    g['Delta_pp'] = g['Precisión'] - g['Precisión_sem_ant']
-    return g
-
-def kpis_mensual(df: pd.DataFrame, anio:int, mes:int, bases: List[str], bloque: Optional[str], franja: Optional[str]):
-    d = df[(pd.Series([f.year for f in df['Fecha']])==anio) & (pd.Series([f.month for f in df['Fecha']])==mes)]
-    if bases: d = d[d['Base'].isin(bases)]
-
-    # Por franja y base (opcional: filtro de Bloque)
-    df_fran = d if (not bloque or bloque=="Todos") else d[d['Bloque']==bloque]
-    out_f=[]
-    for (fr, base), dd in df_fran.groupby(['Franja','Base']):
-        proy, real = dd['Proy'].sum(), dd['Real'].sum()
-        err = (dd['Proy']-dd['Real']).abs().sum()
-        prec = (1-err/real) if real>0 else np.nan
-        wape = (err/real) if real>0 else np.nan
-        out_f.append(dict(Corte='Franja', Valor=fr, Base=base, Proy=proy, Real=real, ErrorAbs=err, Precisión=prec, WAPE=wape))
-    fran = pd.DataFrame(out_f)
-
-    # Por bloque y base (opcional: filtro de Franja)
-    df_b = d if (not franja or franja=="Todos") else d[d['Franja']==franja]
-    out_b=[]
-    for base, dd_base in df_b.groupby('Base'):
-        proy, real = dd_base['Proy'].sum(), dd_base['Real'].sum()
-        err = (dd_base['Proy']-dd_base['Real']).abs().sum()
-        prec = (1-err/real) if real>0 else np.nan
-        wape = (err/real) if real>0 else np.nan
-        out_b.append(dict(Corte='Bloque', Valor='TOTAL', Base=base, Proy=proy, Real=real, ErrorAbs=err, Precisión=prec, WAPE=wape))
-        for bl, dd in dd_base.groupby('Bloque'):
-            proy, real = dd['Proy'].sum(), dd['Real'].sum()
-            err = (dd['Proy']-dd['Real']).abs().sum()
-            prec = (1-err/real) if real>0 else np.nan
-            wape = (err/real) if real>0 else np.nan
-            out_b.append(dict(Corte='Bloque', Valor=bl, Base=base, Proy=proy, Real=real, ErrorAbs=err, Precisión=prec, WAPE=wape))
-    bloq = pd.DataFrame(out_b)
+def to_excel_bytes(df: pd.DataFrame, sheet_name="datos", fname="reporte.xlsx") -> tuple[bytes,str]:
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as wr:
+        df.to_excel(wr, index=False, sheet_name=sheet_name)
+    return buf.getvalue(), fname
 
     return fran, bloq
