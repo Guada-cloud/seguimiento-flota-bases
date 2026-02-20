@@ -12,7 +12,7 @@ from utils_ops import (
 )
 from pathlib import Path
 
-# ========= Config UI general =========
+# ========= Config UI =========
 st.set_page_config(page_title="Plan vs Real — Operación", layout="wide")
 TEMPLATE = "plotly_dark"
 FONT = "Inter, system-ui, Segoe UI, Roboto"
@@ -68,7 +68,7 @@ st.caption("Móviles y Servicios · Multi‑Base por hoja · Filtros por Base, H
 def _to_list(text: str):
     return [s.strip() for s in text.split(",") if s.strip()] if text else None
 
-# ========= Carga inicial desde /data si existe
+# ========= Carga desde /data si existe
 if st.session_state["plan_df"] is None and PLAN_CSV.exists():
     try: st.session_state["plan_df"] = load_csv(PLAN_CSV)
     except Exception: pass
@@ -95,11 +95,17 @@ if page == "Configuración":
                     st.session_state["real_df"] = real_all
                     st.session_state["params_df"] = params_df
 
-                    rep_ok = [r for r in reporte if r.get("ok")]
-                    rep_err= [r for r in reporte if not r.get("ok")]
-                    st.success(f"Procesadas {len(rep_ok)} hojas. Bases: " + ", ".join(sorted({r['base'] for r in rep_ok})))
+                    # ----- Resumen sin f-strings complicados -----
+                    rep_ok  = [r for r in reporte if r.get("ok")]
+                    rep_err = [r for r in reporte if not r.get("ok")]
+
+                    bases_text = ", ".join(sorted({r["base"] for r in rep_ok}))
+                    st.success("Procesadas {} hojas. Bases: {}".format(len(rep_ok), bases_text))
+
                     if rep_err:
-                        st.warning("Hojas con error: " + ", ".join([f\"{r['sheet']} ({r.get('error','')})\" for r in rep_err]))
+                        err_list = ", ".join(["{} ({})".format(r["sheet"], r.get("error","")) for r in rep_err])
+                        st.warning("Hojas con error: " + err_list)
+                    # ---------------------------------------------
 
                     c1, c2 = st.columns(2)
                     with c1:
@@ -188,7 +194,7 @@ if page == "Configuración":
         st.info("Cargá Planificación y Realidad (o el libro multi‑Base) para habilitar el merge.")
 
 else:
-    # Páginas analíticas requieren 'merged'
+    # Requiere merged
     if st.session_state["merged"] is None:
         st.warning("Primero cargá y mapeá Planificación y Realidad en **Configuración**.")
         st.stop()
