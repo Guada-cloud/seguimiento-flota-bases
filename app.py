@@ -1,151 +1,259 @@
-# app.py — Streamlit (ES) con Bases
-import streamlit as st, pandas as pd, numpy as np, plotly.express as px
-from utils_kpi import (
-    normalizar_entrada, kpis_dia, kpis_semanal, kpis_mensual,
-    BLOQUES_VALIDOS, FRANJAS, BASES_VALIDAS
+# app.py — Planificación vs Realidad Operativa 
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+from pathlib import Path
+from utils_ops import (
+    EXPECTED_PLAN, EXPECTED_REAL, _guess_map, apply_map, enrich_time,
+    merge_plan_real, compute_metrics, agg_error_metrics, add_time_keys,
+    filter_df, top5_hours, worst_base,
+    save_csv, load_csv, PLAN_CSV, REAL_CSV, MERG_CSV, to_excel_bytes
 )
 
-st.set_page_config(page_title='Seguimiento de Precisión — Flota', layout='wide')
-st.title('Seguimiento de Precisión — Flota')
-st.caption('KPIs Diario (principal), Semana a semana y Mensual · Cortes por **Base**, **Bloque** y **Franja** · Sin macros')
+# ========= Config UI general =========
+st.set_page_config(page_title="Plan vs Real — Operación", layout="wide")
+TEMPLATE = "plotly_dark"
+FONT = "Inter, system-ui, Segoe UI, Roboto"
 
-with st.sidebar:
-    st.header('Cargar datos')
-    f = st.file_uploader(
-        'Subí tu Excel (.xlsx). Puede ser 1 hoja por Base (PROY_6001, PROY_MECA, etc.) o un plano con columna Base.',
-        type=['xlsx','xlsm']
+def stylize(fig, title=None, y_pct=False):
+    fig.update_layout(
+        template=TEMPLATE,
+        title=title,
+        font=dict(family=FONT, size=13, color="#E5E7EB"),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        legend_title_text="", margin=dict(t=45, r=10, b=30, l=10),
     )
-    demo = st.checkbox('Usar datos de muestra', value=not bool(f))
-    st.markdown("**Tips**  \n- Si tu archivo tiene una hoja por Base, infiero la **Base** del **nombre de la hoja**.  \n- Columnas mínimas: **Fecha, Hora, Bloque, Proy, Real** (y opcional **Base**).")
+    if y_pct:
+        fig.update_yaxes(tickformat=".0%")
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(gridcolor="rgba(148,163,184,.25)")
+    return fig
 
-@st.cache_data(show_spinner=False)
-def _load_demo():
-    rng = pd.date_range('2026-02-01','2026-02-10', freq='H')
-    rows=[]; bls=BLOQUES_VALIDOS
-    bases=['PROY_6001','PROY_MECA','PROY_10541','PROY_13305','DEMOTOS']
-    for ts in rng:
-        for bl in bls:
-            for base in bases:
-                proy = np.random.randint(40, 160)
-                real = max(0, int(proy + np.random.normal(0, proy*0.15)))
-                rows.append(dict(Fecha=ts.date(), Hora=ts.time().strftime('%H:%M'), Bloque=bl, Proy=proy, Real=real, Base=base))
-    df = pd.DataFrame(rows)
-    return normalizar_entrada(df)
+# ========= Estado =========
+if "plan_df" not in st.session_state: st.session_state["plan_df"] = None
+if "real_df" not in st.session_state: st.session_state["real_df"] = None
+if "merged"  not in st.session_state: st.session_state["merged"]  = None
 
-@st.cache_data(show_spinner=False)
-def _read_excel_to_long(file) -> pd.DataFrame:
-    xls = pd.ExcelFile(file)
-    frames = []
-    for sheet in xls.sheet_names:
-        d = pd.read_excel(xls, sheet_name=sheet)
-        try:
-            frames.append(normalizar_entrada(d, sheet_name=sheet))
-        except Exception:
-            # hojas no compatibles se ignoran
-            pass
-    if not frames:
-        d = pd.read_excel(xls, sheet_name=0)
-        frames = [normalizar_entrada(d, sheet_name=xls.sheet_names[0])]
-    return pd.concat(frames, ignore_index=True)
+# ========= Sidebar (menú y filtros) =========
+with st.sidebar:
+    st.header("Menú")
+    page = st.radio("Navegación", ["Dashboard", "Análisis por Base", "Análisis Horario", "Auditoría Detallada", "Configuración"], index=0)
 
-df = _load_demo() if (demo and not f) else (_read_excel_to_long(f) if f else None)
-if df is None:
-    st.warning('Subí un archivo o activá **datos de muestra**.')
-    st.stop()
+    st.markdown("---")
+    st.header("Filtros")
+    # Estos filtros se aplican a la tabla merged cuando exista
+    fecha_sel = st.date_input("Día", value=None)
+    semana_sel = st.number_input("Semana ISO", value=0, step=1, min_value=0)
+    mes_text = st.text_input("Mes (aaaa-mm)", value="")
 
-st.success(f"Datos cargados: {len(df):,} filas · {df['Fecha'].min()} → {df['Fecha'].max()} · Bases: {', '.join(sorted(df['Base'].unique()))}")
+    base_sel = st.text_input("Base (dejar vacío = todas)", value="")
+    horas_multi = st.text_input("Horas (HH:MM, separadas por coma)", value="")
 
-# ===== Filtros =====
-colf = st.columns([1.2,1,1,1.2,1.2,1.2])
-with colf[0]:
-    fecha_sel = st.date_input('Fecha (diario)', value=pd.to_datetime(df['Fecha'].max()).date())
-with colf[1]:
-    semana_sel_default = int(df.loc[df['Fecha']==fecha_sel,'Semana'].head(1).fillna(0).values[0]) if (df['Fecha']==fecha_sel).any() else int(df['Semana'].dropna().max())
-    semana_sel = st.number_input('Semana (comparar)', value=int(semana_sel_default), step=1)
-with colf[2]:
-    mes_def = pd.to_datetime(fecha_sel).strftime('%Y-%m')
-    mes_text = st.text_input('Mes (aaaa-mm)', value=mes_def)
+    st.markdown("---")
+    st.header("Persistencia")
+    c1,c2 = st.columns(2)
+    with c1:
+        if st.button("💾 Guardar CSVs"):
+            if st.session_state["plan_df"] is not None:
+                save_csv(st.session_state["plan_df"], PLAN_CSV)
+            if st.session_state["real_df"] is not None:
+                save_csv(st.session_state["real_df"], REAL_CSV)
+            if st.session_state["merged"] is not None:
+                save_csv(st.session_state["merged"],  MERG_CSV)
+            st.success("Datos guardados en /data.")
+    with c2:
+        if st.button("🧹 Limpiar memoria"):
+            for k in ["plan_df","real_df","merged"]:
+                st.session_state[k] = None
+            st.success("Memoria limpiada (la carpeta /data no se toca).")
+
+# ========= Encabezado =========
+st.title("Comparación — Planificación vs Realidad Operativa")
+st.caption("Móviles y Servicios · Filtros por Base, Hora, Día, Semana ISO y Mes · Persistencia en /data")
+
+# ========= Utilidad de filtros a lista
+def _hour_list(text: str) -> list[str]|None:
+    t = [s.strip() for s in text.split(",") if s.strip()] if text else []
+    return t if t else None
+
+# ========= Carga inicial desde /data si existe
+if st.session_state["plan_df"] is None and PLAN_CSV.exists():
     try:
-        anio, mes = int(mes_text.split('-')[0]), int(mes_text.split('-')[1])
+        st.session_state["plan_df"] = load_csv(PLAN_CSV)
     except Exception:
-        anio, mes = int(pd.to_datetime(df['Fecha'].max()).year), int(pd.to_datetime(df['Fecha'].max()).month)
-with colf[3]:
-    bases = sorted(df['Base'].unique().tolist())
-    selected_bases = st.multiselect('Bases', options=bases, default=bases)
-with colf[4]:
-    bloque = st.selectbox('Bloque/Zona', options=['Todos']+BLOQUES_VALIDOS, index=0)
-with colf[5]:
-    franja = st.selectbox('Franja', options=['Todos']+FRANJAS, index=0)
+        pass
+if st.session_state["real_df"] is None and REAL_CSV.exists():
+    try:
+        st.session_state["real_df"] = load_csv(REAL_CSV)
+    except Exception:
+        pass
+if st.session_state["merged"] is None and MERG_CSV.exists():
+    try:
+        st.session_state["merged"] = load_csv(MERG_CSV)
+    except Exception:
+        pass
 
-st.divider()
+# ========= Páginas =========
+if page == "Configuración":
+    st.subheader("Carga de Planificación")
+    up_plan = st.file_uploader("Excel de Planificación", type=["xlsx","xlsm"], key="plan")
+    if up_plan:
+        dfp_raw = pd.read_excel(up_plan)
+        st.write("Vista previa Planificación:", dfp_raw.head())
 
-TAB_TOTAL, TAB_BASES = st.tabs(["Visión Total","Detalle por Base"])
+        # Mapeo de columnas
+        suggest = _guess_map(dfp_raw, EXPECTED_PLAN)
+        st.markdown("**Mapear columnas (Plan):**")
+        m = {}
+        for target in ["Fecha","Hora","Base","Moviles_Planificados","Servicios_Planificados"]:
+            m[target] = st.selectbox(f"{target}", options=[""] + list(dfp_raw.columns),
+                                     index=([""]+list(dfp_raw.columns)).index(suggest[target]) if suggest[target] in dfp_raw.columns else 0,
+                                     key=f"map_plan_{target}")
+        try:
+            dfp = apply_map(dfp_raw, m, "plan")
+            dfp = enrich_time(dfp)
+            st.session_state["plan_df"] = dfp
+            st.success("Planificación cargada y normalizada.")
+        except Exception as e:
+            st.error(f"Error mapeando Planificación: {e}")
 
-with TAB_TOTAL:
-    by_hour, agg_total, prec_dia, wape_dia, sesgo_dia = kpis_dia(df, fecha_sel, selected_bases, bloque, franja)
-    k1,k2,k3 = st.columns(3)
-    k1.metric('Precisión (día)', f"{prec_dia:.2%}" if pd.notna(prec_dia) else '—')
-    k2.metric('WAPE (día)', f"{wape_dia:.2%}" if pd.notna(wape_dia) else '—')
-    k3.metric('Sesgo (día)', f"{sesgo_dia:,.0f}" if pd.notna(sesgo_dia) else '—')
+    st.markdown("---")
+    st.subheader("Carga de Realidad")
+    up_real = st.file_uploader("Excel de Realidad", type=["xlsx","xlsm"], key="real")
+    if up_real:
+        dfr_raw = pd.read_excel(up_real)
+        st.write("Vista previa Realidad:", dfr_raw.head())
 
-    # Proy vs Real por hora (TOTAL)
-    bh = by_hour.groupby('Hora', as_index=False).agg(Proy=('Proy','sum'), Real=('Real','sum'))
-    fig1 = px.bar(bh, x='Hora', y=['Proy','Real'], barmode='group', title='Proyectado vs Real por hora (TOTAL)')
-    fig1.update_layout(legend_title_text='', xaxis_title='Hora', yaxis_title='Servicios')
-    st.plotly_chart(fig1, use_container_width=True)
+        suggest_r = _guess_map(dfr_raw, EXPECTED_REAL)
+        st.markdown("**Mapear columnas (Real):**")
+        mr = {}
+        for target in ["Fecha","Hora","Base","Moviles_Reales","Servicios_Reales"]:
+            mr[target] = st.selectbox(f"{target}", options=[""] + list(dfr_raw.columns),
+                                      index=([""]+list(dfr_raw.columns)).index(suggest_r[target]) if suggest_r[target] in dfr_raw.columns else 0,
+                                      key=f"map_real_{target}")
+        try:
+            dfr = apply_map(dfr_raw, mr, "real")
+            dfr = enrich_time(dfr)
+            st.session_state["real_df"] = dfr
+            st.success("Realidad cargada y normalizada.")
+        except Exception as e:
+            st.error(f"Error mapeando Realidad: {e}")
 
-    # Semanal (TOTAL)
-    g = kpis_semanal(df, anio, mes, semana_sel, selected_bases, bloque, franja)
-    g_total = g.groupby('Semana', as_index=False).agg(Precisión=('Precisión','mean'))
-    fig2 = px.line(g_total, x='Semana', y='Precisión', markers=True, title='Precisión por semana (TOTAL)')
-    fig2.update_layout(yaxis_tickformat='.0%')
-    st.plotly_chart(fig2, use_container_width=True)
+    st.markdown("---")
+    if st.session_state["plan_df"] is not None and st.session_state["real_df"] is not None:
+        st.subheader("Merge y cálculo de métricas")
+        merged0 = merge_plan_real(st.session_state["plan_df"], st.session_state["real_df"])
+        merged0 = add_time_keys(merged0)
+        merged = compute_metrics(merged0)
+        st.session_state["merged"] = merged
+        st.success(f"Merge OK. Filas: {len(merged):,}")
+        st.dataframe(merged.head(20), use_container_width=True)
+    else:
+        st.info("Cargá Planificación y Realidad para habilitar el merge.")
 
-    # Mensual — WAPE por franja (TOTAL) y Precisión por bloque (TOTAL)
-    fran_m, bloq_m = kpis_mensual(df, anio, mes, selected_bases, bloque if bloque!='Todos' else None, franja if franja!='Todos' else None)
-    fm_total = fran_m.groupby('Valor', as_index=False).agg(WAPE=('WAPE','mean'))
-    bm_total = bloq_m.groupby('Valor', as_index=False).agg(Precisión=('Precisión','mean'))
+else:
+    # Páginas analíticas requieren merged
+    if st.session_state["merged"] is None:
+        st.warning("Primero cargá y mapeá Planificación y Realidad en **Configuración**.")
+        st.stop()
 
-    cm1, cm2 = st.columns(2)
-    with cm1:
-        st.subheader('WAPE por franja (mensual) — TOTAL')
-        fig3 = px.bar(fm_total, x='Valor', y='WAPE', text_auto='.1%')
-        fig3.update_layout(yaxis_tickformat='.0%'); st.plotly_chart(fig3, use_container_width=True)
-    with cm2:
-        st.subheader('Precisión por bloque (mensual) — TOTAL')
-        orden = ['TOTAL'] + [b for b in BLOQUES_VALIDOS]
-        bm_total['Valor'] = pd.Categorical(bm_total['Valor'], categories=orden, ordered=True)
-        bm_total = bm_total.sort_values('Valor')
-        fig4 = px.bar(bm_total, x='Valor', y='Precisión', text_auto='.1%')
-        fig4.update_layout(yaxis_tickformat='.0%'); st.plotly_chart(fig4, use_container_width=True)
+    df_all = st.session_state["merged"].copy()
+    # Aplicar filtros
+    bases_f = [b.strip() for b in base_sel.split(",") if b.strip()] if base_sel else None
+    horas_f = _hour_list(horas_multi)
+    df_f = filter_df(df_all, bases=bases_f, fecha=fecha_sel, semana=(int(semana_sel) if semana_sel>0 else None),
+                     mes=(mes_text if mes_text else None), hora_sel=horas_f)
 
-with TAB_BASES:
-    by_hour, agg_total, prec_dia, wape_dia, sesgo_dia = kpis_dia(df, fecha_sel, selected_bases, bloque, franja)
-    st.subheader('KPIs por Base (día seleccionado)')
-    st.dataframe(agg_total[['Base','Proy','Real','ErrorAbs','Precisión']])
+    if page == "Dashboard":
+        st.subheader("KPIs globales")
+        tot_plan_m = df_f["Moviles_Planificados"].sum()
+        tot_real_m = df_f["Moviles_Reales"].sum()
+        tot_plan_s = df_f["Servicios_Planificados"].sum()
+        tot_real_s = df_f["Servicios_Reales"].sum()
 
-    fig5 = px.bar(by_hour, x='Hora', y='Real', color='Base', barmode='group', title='Real por hora, desglosado por Base')
-    fig5.update_layout(xaxis_title='Hora', yaxis_title='Servicios')
-    st.plotly_chart(fig5, use_container_width=True)
+        desvio_m = (tot_real_m - tot_plan_m) / tot_plan_m * 100 if tot_plan_m>0 else np.nan
+        desvio_s = (tot_real_s - tot_plan_s) / tot_plan_s * 100 if tot_plan_s>0 else np.nan
+        efect = 1 - (abs(tot_real_s - tot_plan_s) / tot_plan_s) if tot_plan_s>0 else np.nan
 
-    g = kpis_semanal(df, anio, mes, semana_sel, selected_bases, bloque, franja)
-    fig6 = px.line(g, x='Semana', y='Precisión', color='Base', markers=True, title='Precisión por semana, por Base')
-    fig6.update_layout(yaxis_tickformat='.0%'); st.plotly_chart(fig6, use_container_width=True)
+        m1,m2,m3 = st.columns(3)
+        m1.metric("Móviles — % Desvío", f"{desvio_m:,.1f}%" if pd.notna(desvio_m) else "—")
+        m2.metric("Servicios — % Desvío", f"{desvio_s:,.1f}%" if pd.notna(desvio_s) else "—")
+        m3.metric("Efectividad", f"{efect:.1%}" if pd.notna(efect) else "—")
 
-    fran_m, bloq_m = kpis_mensual(df, anio, mes, selected_bases, bloque if bloque!='Todos' else None, franja if franja!='Todos' else None)
-    cm1, cm2 = st.columns(2)
-    with cm1:
-        st.subheader('WAPE por franja (mensual) — por Base')
-        fig7 = px.bar(fran_m, x='Valor', y='WAPE', color='Base', barmode='group', text_auto='.1%')
-        fig7.update_layout(yaxis_tickformat='.0%'); st.plotly_chart(fig7, use_container_width=True)
-    with cm2:
-        st.subheader('Precisión por bloque (mensual) — por Base')
-        orden = ['TOTAL'] + [b for b in BLOQUES_VALIDOS]
-        bloq_m['Valor'] = pd.Categorical(bloq_m['Valor'], categories=orden, ordered=True)
-        bloq_m = bloq_m.sort_values(['Base','Valor'])
-        fig8 = px.bar(bloq_m, x='Valor', y='Precisión', color='Base', barmode='group', text_auto='.1%')
-        fig8.update_layout(yaxis_tickformat='.0%'); st.plotly_chart(fig8, use_container_width=True)
+        # Estado general (semáforo por efectividad)
+        if pd.isna(efect): color, txt = ("#6B7280", "Sin datos")
+        elif efect >= 0.92: color, txt = ("#059669", "OK (≥ 92%)")
+        elif efect >= 0.89: color, txt = ("#F59E0B", "Atención (89–92%)")
+        else:                color, txt = ("#DC2626", "Crítico (< 89%)")
+        st.markdown(f"**Estado general:** <span style='color:{color}'>{txt}</span>", unsafe_allow_html=True)
 
-with st.expander('Ver tablas (diario / semanal / mensual)'):
-    st.write('Muestra de datos normalizados:')
-    st.dataframe(df.head(30))
+        # Gráfico línea Plan vs Real (Servicios agregados por Fecha+Hora)
+        g = df_f.groupby(["Fecha","HoraStr"], as_index=False)[["Servicios_Planificados","Servicios_Reales"]].sum()
+        fig1 = px.line(g, x="HoraStr", y=["Servicios_Planificados","Servicios_Reales"], color_discrete_sequence=["#22D3EE","#10B981"])
+        stylize(fig1, "Plan vs Real (Servicios por hora)", y_pct=False); st.plotly_chart(fig1, use_container_width=True)
+
+        # Barras de desvío %
+        g2 = df_f.groupby("HoraStr", as_index=False)["Dif_Servicios"].sum()
+        g2p = df_f.groupby("HoraStr", as_index=False)["Servicios_Planificados"].sum()
+        g2 = g2.merge(g2p, on="HoraStr", how="left")
+        g2["Desvio_%"] = np.where(g2["Servicios_Planificados"]>0, g2["Dif_Servicios"]/g2["Servicios_Planificados"]*100, np.nan)
+        fig2 = px.bar(g2, x="HoraStr", y="Desvio_%", color="Desvio_%", color_continuous_scale="RdYlGn")
+        stylize(fig2, "Desvío % por hora (Servicios)"); st.plotly_chart(fig2, use_container_width=True)
+
+        # Heatmap por hora × día
+        piv = df_f.pivot_table(values="Dif_Servicios", index="Fecha", columns="HoraStr", aggfunc="sum").fillna(0)
+        fig3 = px.imshow(piv, color_continuous_scale="RdYlGn", aspect="auto")
+        stylize(fig3, "Heatmap — Desvío de servicios (Real - Plan)"); st.plotly_chart(fig3, use_container_width=True)
+
+        # Errores agregados
+        mets = agg_error_metrics(df_f)
+        st.markdown(f"**MAPE:** {mets['MAPE_%']:.1f}% · **MAE:** {mets['MAE']:.2f} · **Forecast Bias:** {mets['ForecastBias_%']:.1f}%")
+
+        # Detección automática
+        sub, sobre = top5_hours(df_f)
+        wb = worst_base(df_f)
+        c1,c2,c3 = st.columns([1,1,1])
+        with c1:
+            st.subheader("Top 5 Sub‑plan (horas)")
+            st.dataframe(sub, use_container_width=True, hide_index=True)
+        with c2:
+            st.subheader("Top 5 Sobre‑plan (horas)")
+            st.dataframe(sobre, use_container_width=True, hide_index=True)
+        with c3:
+            st.subheader("Base con mayor desvío")
+            st.dataframe(wb, use_container_width=True, hide_index=True)
+
+    elif page == "Análisis por Base":
+        st.subheader("Desvío por Base (Servicios)")
+        g = df_f.groupby("Base", as_index=False)[["Servicios_Planificados","Servicios_Reales"]].sum()
+        g["Desvio_%"] = np.where(g["Servicios_Planificados"]>0, (g["Servicios_Reales"]-g["Servicios_Planificados"])/g["Servicios_Planificados"]*100, np.nan)
+        fig = px.bar(g, x="Base", y="Desvio_%", color="Desvio_%", color_continuous_scale="RdYlGn")
+        stylize(fig, "Desvío % por Base"); st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(g, use_container_width=True)
+
+    elif page == "Análisis Horario":
+        st.subheader("Series por hora — Plan vs Real (Servicios)")
+        g = df_f.groupby("HoraStr", as_index=False)[["Servicios_Planificados","Servicios_Reales"]].sum()
+        fig = px.line(g, x="HoraStr", y=["Servicios_Planificados","Servicios_Reales"], color_discrete_sequence=["#22D3EE","#10B981"])
+        stylize(fig, "Plan vs Real por hora"); st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("Distribución de desvío (Servicios)")
+        g2 = df_f.groupby("HoraStr", as_index=False)["Dif_Servicios"].sum()
+        fig2 = px.bar(g2, x="HoraStr", y="Dif_Servicios", color="Dif_Servicios", color_continuous_scale="RdYlGn")
+        stylize(fig2, "Desvío (Real - Plan) por hora"); st.plotly_chart(fig2, use_container_width=True)
+        st.dataframe(df_f[["Fecha","HoraStr","Base","Servicios_Planificados","Servicios_Reales","Dif_Servicios","Desvio_Servicios_%","Clasificacion"]].sort_values(["Fecha","HoraStr","Base"]),
+                     use_container_width=True)
+
+    elif page == "Auditoría Detallada":
+        st.subheader("Tabla completa con clasificación")
+        cols = ["Fecha","HoraStr","Base",
+                "Moviles_Planificados","Moviles_Reales","Dif_Moviles","Desvio_Moviles_%",
+                "Servicios_Planificados","Servicios_Reales","Dif_Servicios","Desvio_Servicios_%",
+                "Efectividad","Clasificacion","Status","Semana","Mes","Año"]
+        cols = [c for c in cols if c in df_f.columns]
+        st.dataframe(df_f[cols].sort_values(["Fecha","HoraStr","Base"]), use_container_width=True)
+        # Exportar a Excel
+        bytes_xls, fname = to_excel_bytes(df_f[cols], sheet_name="auditoria", fname="auditoria_plan_vs_real.xlsx")
+        st.download_button("⬇️ Descargar Excel (auditoría)", data=bytes_xls, file_name=fname,
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
