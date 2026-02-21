@@ -1,14 +1,18 @@
-# app.py — Pegado directo (dos datasets: Planificación y Realidad) · Multi-Base · Dashboard completo
+# app.py — Pegado directo de Planificación y Realidad · Detección robusta · Español · Export Excel con gráficos
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
+import re
 from io import StringIO, BytesIO
 from pathlib import Path
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.chart import LineChart, Reference, BarChart
 
-# =====================================
+# ==========================
 # Apariencia
-# =====================================
+# ==========================
 st.set_page_config(page_title="Plan vs Real — Operación (Pegado directo)", layout="wide")
 TEMPLATE = "plotly_dark"
 FONT = "Inter, system-ui, Segoe UI, Roboto"
@@ -20,15 +24,14 @@ def stylize(fig, title=None, y_pct=False):
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         legend_title_text="", margin=dict(t=45, r=10, b=30, l=10),
     )
-    if y_pct:
-        fig.update_yaxes(tickformat=".0%")
+    if y_pct: fig.update_yaxes(tickformat=".0%")
     fig.update_xaxes(showgrid=False)
     fig.update_yaxes(gridcolor="rgba(148,163,184,.25)")
     return fig
 
-# =====================================
+# ==========================
 # Persistencia
-# =====================================
+# ==========================
 DATA_DIR = Path("data"); DATA_DIR.mkdir(exist_ok=True)
 BASES_DIR = DATA_DIR / "bases"; BASES_DIR.mkdir(exist_ok=True)
 MERGED_CSV = DATA_DIR / "merged.csv"
@@ -39,41 +42,61 @@ def save_csv(df: pd.DataFrame, path: Path):
 def load_csv(path: Path) -> pd.DataFrame|None:
     return pd.read_csv(path, encoding="utf-8") if path.exists() else None
 
-def to_excel_bytes(df: pd.DataFrame, sheet="datos", name="reporte.xlsx"):
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as wr:
-        df.to_excel(wr, index=False, sheet_name=sheet)
-    return buf.getvalue(), name
-
-# =====================================
+# ==========================
 # Estado
-# =====================================
-if "bases" not in st.session_state:     # { base: DataFrame con múltiples fechas }
+# ==========================
+if "bases" not in st.session_state:    # { base: df (varias fechas) }
     st.session_state["bases"] = {}
 if "merged" not in st.session_state:
     st.session_state["merged"] = pd.DataFrame()
-if "_preview" not in st.session_state:  # vista previa del último pegado fusionado (plan+real) para la base/fecha seleccionada
+if "_preview" not in st.session_state: # última previsualización fusionada (plan+real) para base/fecha
     st.session_state["_preview"] = pd.DataFrame()
 
-# =====================================
-# Mapeo flexible de columnas
-# (tolerante a acentos, mayúsculas/minúsculas y variaciones)
-# =====================================
+# ============================================================
+# Detección robusta de columnas (muchas variaciones en español)
+# ============================================================
 SYN = {
-    "hora":      ["hora","hr","tiempo","h"],
-    "svc_plan":  ["svc proy","servicios proy","svc plan","serv plan","serv proyectados","servicios proyectados","proyectado","planificado"],
-    "svc_real":  ["svc reales","servicios reales","svc real","serv real","observado","observados","reales"],
-    "mov_plan":  ["mov req","mov requeridos","mov plan","moviles plan","moviles requeridos","req moviles"],
-    "mov_real":  ["moviles x nomina","mov x nomina","mov reales","mov real","nomina","nómina","moviles nómina"],
-    "coef_hs":   ["coeficiente hs","coef hs","coef hs.","coeficiente horas"],
-    "dif_mov":   ["dif moviles","dif mov","delta moviles","delta mov.","moviles delta"]
+    "hora": [
+        "hora","hr","tiempo","h"
+    ],
+    "svc_plan": [
+        "svc proy","servicios proy","servicios proyectados","svc plan","serv plan",
+        "proyectado","planificado","plan","proy","proyectados"
+    ],
+    "svc_real": [
+        "svc reales","servicios reales","svc real","serv real","real","reales",
+        "observado","observados"
+    ],
+    "mov_plan": [
+        # requeridos / planificados
+        "mov req","mov requeridos","mov plan","moviles plan","móviles plan","moviles requeridos",
+        "req moviles","requeridos","plan moviles","movil requerido","moviles requeridas",
+        "dotación plan","dotacion plan","staff plan","agentes plan","operadores plan"
+    ],
+    "mov_real": [
+        # nómina / reales / dotación efectiva
+        "moviles x nomina","mov x nomina","moviles nomina","movil nomina","nómina","nomina",
+        "mov reales","mov real","móviles reales","móviles real",
+        "dotación","dotacion","staff","agentes","operadores","plantilla","planta",
+        "dotación efectiva","dotacion efectiva"
+    ],
+    "coef_hs": [
+        "coeficiente hs","coef hs","coef hs.","coeficiente horas","coeficiente segun hs op previstas"
+    ],
+    "dif_mov": [
+        "dif moviles","dif mov","delta moviles","delta mov.","variacion moviles","variación móviles"
+    ]
 }
+
+# si no viene encabezado, asigno por posición típica
+DEFAULT_ORDER = ["hora","svc_plan","svc_real","mov_plan","mov_real","coef_hs","dif_mov"]
 
 def _norm(s: str) -> str:
     s = str(s).strip().lower()
     rep = {"á":"a","é":"e","í":"i","ó":"o","ú":"u","ñ":"n"}
     for a,b in rep.items(): s = s.replace(a,b)
-    return " ".join(s.split())
+    s = re.sub(r"\s+"," ", s)
+    return s
 
 def _find_col(cols, aliases):
     m = { _norm(c): c for c in cols }
@@ -86,64 +109,104 @@ def _find_col(cols, aliases):
             if a in k: return v
     return None
 
-# Conversión de números robusta (coma o punto decimal, miles, "#¿NOMBRE?")
-def _to_num_series(s: pd.Series) -> pd.Series:
-    s = s.astype(str).str.strip()
-    s = s.replace({"": np.nan, "nan": np.nan, "None": np.nan, "#¿NOMBRE?": np.nan, "#¡NOMBRE?": np.nan}, regex=False)
-    # Detecta decimal/coma: si hay coma y punto, usa la última como decimal y remueve el otro como miles
-    def _fix_one(x:str):
-        if x is np.nan or x is None: return np.nan
-        txt = str(x)
-        if txt.count(",") and txt.count("."):
-            # si la última coma está después del último punto -> coma decimal
-            if txt.rfind(",") > txt.rfind("."):
-                txt = txt.replace(".", "").replace(",", ".")
-            else:  # punto decimal
-                txt = txt.replace(",", "")
-        else:
-            if "," in txt and "." not in txt:
-                txt = txt.replace(",", ".")
-            # si solo hay punto, lo toma como decimal directamente
-        try:
-            return float(txt)
-        except Exception:
-            return np.nan
-    return s.map(_fix_one)
-
-def _to_time_series(s: pd.Series) -> pd.Series:
-    # Acepta "HH:MM" o "H:MM" o excel-like
-    return pd.to_datetime(s.astype(str), errors="coerce").dt.time
-
-# =====================================
-# Parsers (Plan y Real) a partir de pegado
-# =====================================
-def detect_sep(text: str) -> str:
+def _smart_sep(text: str) -> str:
     sample = text[:1000]
     if "\t" in sample: return "\t"
     if ";" in sample:  return ";"
     return ","  # fallback
 
-def parse_pasted_generic(text: str) -> pd.DataFrame:
+def _to_num_series(s: pd.Series) -> pd.Series:
+    s = s.astype(str).str.strip()
+    s = s.replace({"": np.nan, "nan": np.nan, "None": np.nan,
+                   "#¿NOMBRE?": np.nan, "#¡NOMBRE?": np.nan, "#VALUE!": np.nan}, regex=False)
+    def _fix_one(x:str):
+        if x is np.nan or x is None: return np.nan
+        txt = str(x)
+        # miles/decimal heurística
+        if "," in txt and "." in txt:
+            # última coma > último punto => coma decimal
+            if txt.rfind(",") > txt.rfind("."):
+                txt = txt.replace(".", "").replace(",", ".")
+            else:
+                txt = txt.replace(",", "")
+        elif "," in txt:
+            txt = txt.replace(",", ".")
+        try:
+            return float(txt)
+        except:
+            return np.nan
+    return s.map(_fix_one)
+
+def _to_time_series(s: pd.Series) -> pd.Series:
+    # Acepta "HH:MM", "H:MM" o serial Excel (si viniesen números)
+    try:
+        return pd.to_datetime(s.astype(str), errors="coerce").dt.time
+    except:
+        return pd.to_datetime([""], errors="coerce").dt.time  # todo NaT
+
+def parse_pasted_flexible(text: str) -> pd.DataFrame:
     """
-    Lee un pegado libre que puede contener Plan y/o Real en la misma tabla.
-    Devuelve un DF con columnas estandarizadas: Hora, SvcPlan, SvcReal, MovPlan, MovReal, CoefHS, DifMov
-    (lo que no esté en el pegado queda como NaN).
+    Parser flexible: acepta encabezados "casi cualquiera" o sin encabezados.
+    Devuelve columnas estandar: Hora, SvcPlan, SvcReal, MovPlan, MovReal, CoefHS, DifMov_archivo
     """
     if not text or not text.strip():
         return pd.DataFrame()
-    sep = detect_sep(text)
-    df = pd.read_csv(StringIO(text), sep=sep, engine="python", dtype=str)
+    sep = _smart_sep(text)
 
-    hora_c  = _find_col(df.columns, SYN["hora"])
-    sp_c    = _find_col(df.columns, SYN["svc_plan"])
-    sr_c    = _find_col(df.columns, SYN["svc_real"])
-    mp_c    = _find_col(df.columns, SYN["mov_plan"])
-    mr_c    = _find_col(df.columns, SYN["mov_real"])
-    coef_c  = _find_col(df.columns, SYN["coef_hs"])
-    difm_c  = _find_col(df.columns, SYN["dif_mov"])
+    # intento con encabezado
+    df = pd.read_csv(StringIO(text), sep=sep, engine="python", dtype=str)
+    cols = list(df.columns)
+
+    # ¿reconocemos HORA?
+    hora_c = _find_col(cols, SYN["hora"])
 
     if hora_c is None:
-        raise ValueError("No se encontró columna de HORA en el pegado.")
+        # puede venir SIN encabezado → re-leo sin header
+        df = pd.read_csv(StringIO(text), sep=sep, header=None, engine="python", dtype=str)
+        # ubico la col de hora por patrón HH:MM en la primera fila
+        guess_hora_idx = None
+        for j in range(min(10, df.shape[1])): # miro primeras 10
+            val = str(df.iloc[0, j])
+            if re.match(r"^\d{1,2}:\d{2}$", val.strip()):
+                guess_hora_idx = j; break
+        if guess_hora_idx is None:
+            # como último recurso, pruebo convertir todas y ver cuál tiene menos NaT
+            best, best_j = 9999, None
+            for j in range(df.shape[1]):
+                ok = pd.to_datetime(df[j].astype(str), errors="coerce").dt.time.notna().sum()
+                if ok < best:
+                    best = ok; best_j = j
+            guess_hora_idx = best_j
+
+        # asigno encabezados por orden típico
+        n = df.shape[1]
+        names = DEFAULT_ORDER[:n]
+        df.columns = names
+        # renombro la col detectada como 'hora'
+        if guess_hora_idx is not None and guess_hora_idx < len(names):
+            names[guess_hora_idx] = "hora"
+            df.columns = names
+
+        # mapeo a estándar
+        out = pd.DataFrame()
+        out["Hora"]    = _to_time_series(df.get("hora", pd.Series(dtype=str)))
+        out["SvcPlan"] = _to_num_series(df.get("svc_plan", pd.Series(dtype=str)))
+        out["SvcReal"] = _to_num_series(df.get("svc_real", pd.Series(dtype=str)))
+        out["MovPlan"] = _to_num_series(df.get("mov_plan", pd.Series(dtype=str)))
+        out["MovReal"] = _to_num_series(df.get("mov_real", pd.Series(dtype=str)))
+        out["CoefHS"]  = _to_num_series(df.get("coef_hs", pd.Series(dtype=str)))
+        out["DifMov_archivo"] = _to_num_series(df.get("dif_mov", pd.Series(dtype=str)))
+        out = out[out["Hora"].notna()]
+        out["HoraStr"] = pd.to_datetime(out["Hora"].astype(str)).dt.strftime("%H:%M")
+        return out.reset_index(drop=True)
+
+    # con encabezado → mapeo flexible
+    sp_c   = _find_col(cols, SYN["svc_plan"])
+    sr_c   = _find_col(cols, SYN["svc_real"])
+    mp_c   = _find_col(cols, SYN["mov_plan"])
+    mr_c   = _find_col(cols, SYN["mov_real"])
+    coef_c = _find_col(cols, SYN["coef_hs"])
+    dif_c  = _find_col(cols, SYN["dif_mov"])
 
     out = pd.DataFrame()
     out["Hora"]    = _to_time_series(df[hora_c])
@@ -152,42 +215,47 @@ def parse_pasted_generic(text: str) -> pd.DataFrame:
     out["MovPlan"] = _to_num_series(df[mp_c]) if mp_c else np.nan
     out["MovReal"] = _to_num_series(df[mr_c]) if mr_c else np.nan
     out["CoefHS"]  = _to_num_series(df[coef_c]) if coef_c else np.nan
-    # Dif móviles: si viene, lo tomo; si no, lo calcularé luego
-    out["DifMov_archivo"] = _to_num_series(df[difm_c]) if difm_c else np.nan
-
+    out["DifMov_archivo"] = _to_num_series(df[dif_c]) if dif_c else np.nan
     out = out[out["Hora"].notna()]
     out["HoraStr"] = pd.to_datetime(out["Hora"].astype(str)).dt.strftime("%H:%M")
     return out.reset_index(drop=True)
 
-def merge_plan_real_from_pastes(plan_df: pd.DataFrame, real_df: pd.DataFrame) -> pd.DataFrame:
+def merge_plan_real(plan_df: pd.DataFrame, real_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Fusiona dos DF parciales (al menos Hora + {SvcPlan/MovPlan} y Hora + {SvcReal/MovReal}).
-    Si alguno viene con las dos mitades, también se respeta (se usa el valor no nulo).
+    Fusiona por Hora. Si alguno trae columnas del otro (p.ej. pegaste todo en uno), se respeta.
     """
-    # Unificar por Hora
-    key = ["HoraStr"]
-    left  = plan_df[["Hora","HoraStr","SvcPlan","MovPlan","CoefHS","DifMov_archivo"]].copy()
-    right = real_df[["HoraStr","SvcReal","MovReal"]].copy()
+    # normalizo claves mínimas
+    left  = plan_df[["Hora","HoraStr"]].copy()
+    for c in ["SvcPlan","MovPlan","CoefHS","DifMov_archivo"]:
+        left[c] = plan_df[c] if c in plan_df else np.nan
+
+    right = real_df[["HoraStr"]].copy()
+    for c in ["SvcReal","MovReal"]:
+        right[c] = real_df[c] if c in real_df else np.nan
 
     m = pd.merge(left, right, on="HoraStr", how="outer")
-    # Completar Hora si quedó vacía del lado real
     m["Hora"] = m["Hora"].fillna(pd.to_datetime(m["HoraStr"]).dt.time)
 
-    # Recalcular DifMov si falta
-    dif_calc = m["MovReal"] - m["MovPlan"]
-    m["DifMov"] = np.where(m["DifMov_archivo"].notna(), m["DifMov_archivo"], dif_calc)
+    # si en plan venía algo de real (o viceversa), completo con el no nulo
+    if "SvcPlan" in plan_df and "SvcReal" in plan_df:
+        m["SvcReal"] = np.where(m["SvcReal"].notna(), m["SvcReal"], plan_df.set_index("HoraStr")["SvcReal"].reindex(m["HoraStr"]).values)
+    if "MovPlan" in plan_df and "MovReal" in plan_df:
+        m["MovReal"] = np.where(m["MovReal"].notna(), m["MovReal"], plan_df.set_index("HoraStr")["MovReal"].reindex(m["HoraStr"]).values)
 
-    # Renombrar a columnas estándar finales
-    out = pd.DataFrame()
-    out["Hora"]  = m["Hora"]
-    out["HoraStr"] = m["HoraStr"]
-    out["Servicios_Planificados"] = m["SvcPlan"]
-    out["Servicios_Reales"]       = m["SvcReal"]
-    out["Moviles_Planificados"]   = m["MovPlan"]
-    out["Moviles_Reales"]         = m["MovReal"]
-    out["Coeficiente_HS"]         = m["CoefHS"]
-    out["Dif_Moviles"]            = m["DifMov"]
-    return out.sort_values("HoraStr").reset_index(drop=True)
+    # Dif móviles del archivo o calculado
+    dif_calc = m["MovReal"] - m["MovPlan"]
+    m["DifMov"] = np.where(m.get("DifMov_archivo", pd.Series([np.nan]*len(m))).notna(), m["DifMov_archivo"], dif_calc)
+
+    out = pd.DataFrame({
+        "Hora": m["Hora"], "HoraStr": m["HoraStr"],
+        "Servicios_Planificados": m["SvcPlan"],
+        "Servicios_Reales": m["SvcReal"],
+        "Moviles_Planificados": m["MovPlan"],
+        "Moviles_Reales": m["MovReal"],
+        "Coeficiente_HS": m["CoefHS"],
+        "Dif_Moviles": m["DifMov"]
+    }).sort_values("HoraStr").reset_index(drop=True)
+    return out
 
 def enrich_with_time_and_metrics(df: pd.DataFrame, fecha, base) -> pd.DataFrame:
     out = df.copy()
@@ -196,17 +264,15 @@ def enrich_with_time_and_metrics(df: pd.DataFrame, fecha, base) -> pd.DataFrame:
 
     out["Fecha_dt"] = pd.to_datetime(out["Fecha"])
     iso = out["Fecha_dt"].dt.isocalendar()
-    out["Año"] = out["Fecha_dt"].dt.year
-    out["Mes"] = out["Fecha_dt"].dt.month
+    out["Año"]    = out["Fecha_dt"].dt.year
+    out["Mes"]    = out["Fecha_dt"].dt.month
     out["Semana"] = iso.week
-    out["Dia"] = out["Fecha_dt"].dt.day
+    out["Dia"]    = out["Fecha_dt"].dt.day
 
-    # Métricas servicios y móviles
+    # Métricas
     out["Dif_Servicios"] = out["Servicios_Reales"] - out["Servicios_Planificados"]
-    out["Desvio_Servicios_%"] = np.where(out["Servicios_Planificados"]>0,
-                                         out["Dif_Servicios"]/out["Servicios_Planificados"]*100, np.nan)
-    out["Desvio_Moviles_%"] = np.where(out["Moviles_Planificados"]>0,
-                                       out["Dif_Moviles"]/out["Moviles_Planificados"]*100, np.nan)
+    out["Desvio_Servicios_%"] = np.where(out["Servicios_Planificados"]>0, out["Dif_Servicios"]/out["Servicios_Planificados"]*100, np.nan)
+    out["Desvio_Moviles_%"]   = np.where(out["Moviles_Planificados"]>0, out["Dif_Moviles"]/out["Moviles_Planificados"]*100, np.nan)
     out["Efectividad"] = np.where(out["Servicios_Planificados"]>0,
                                   1 - (out["Dif_Servicios"].abs()/out["Servicios_Planificados"]), np.nan)
     out["APE"] = np.where(out["Servicios_Planificados"]>0,
@@ -214,7 +280,6 @@ def enrich_with_time_and_metrics(df: pd.DataFrame, fecha, base) -> pd.DataFrame:
     out["AE"]  = (out["Servicios_Reales"] - out["Servicios_Planificados"]).abs()
     out["Bias"]= (out["Servicios_Planificados"] - out["Servicios_Reales"])
 
-    # Estado/Clasificación
     out["Status"] = np.select(
         [out["Servicios_Planificados"].notna() & out["Servicios_Reales"].isna(),
          out["Servicios_Planificados"].isna() & out["Servicios_Reales"].notna()],
@@ -230,65 +295,164 @@ def enrich_with_time_and_metrics(df: pd.DataFrame, fecha, base) -> pd.DataFrame:
     )
     return out
 
-def agg_error_metrics(df: pd.DataFrame) -> dict:
-    d = df.copy()
-    mape = d["APE"].mean()*100 if "APE" in d and d["APE"].notna().any() else np.nan
-    mae  = d["AE"].mean() if "AE" in d and d["AE"].notna().any() else np.nan
-    fbias = (d["Bias"].sum()/d["Servicios_Reales"].sum()*100) if "Bias" in d and d["Servicios_Reales"].sum()!=0 else np.nan
-    return {"MAPE_%":mape, "MAE":mae, "ForecastBias_%":fbias}
+# ==========================
+# Export Excel enriquecido (bonito, con gráficos y explicación)
+# ==========================
+def export_excel_pretty(df: pd.DataFrame, nombre="analisis_plan_vs_real.xlsx"):
+    # Hojas: Resumen (KPIs + texto), Graficos (2 charts), Datos (tabla)
+    wb = Workbook()
+    ws_res = wb.active; ws_res.title = "Resumen"
+    ws_g   = wb.create_sheet("Gráficos")
+    ws_d   = wb.create_sheet("Datos")
 
-# =====================================
-# Sidebar — Ingreso y guardado
-# =====================================
+    # --------- Estilos ----------
+    thin = Side(style="thin", color="334155")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    fill_hdr = PatternFill("solid", fgColor="0B1221")
+    fill_blk = PatternFill("solid", fgColor="111827")
+    font_hdr = Font(color="E5E7EB", bold=True, size=13)
+    font_txt = Font(color="E5E7EB")
+    # Fondo oscuro
+    for ws in [ws_res, ws_g, ws_d]:
+        for col in range(1, 12):
+            ws.column_dimensions[chr(64+col if col<=26 else 64)].width = 16
+
+    # --------- Resumen ----------
+    k1 = ("Efectividad de la planificación",)
+    k2 = ("% Desvío en Servicios",)
+    k3 = ("% Desvío en Móviles",)
+
+    tot_plan_s = df["Servicios_Planificados"].sum()
+    tot_real_s = df["Servicios_Reales"].sum()
+    tot_plan_m = df["Moviles_Planificados"].sum()
+    tot_real_m = df["Moviles_Reales"].sum()
+
+    efect = 1 - (abs(tot_real_s - tot_plan_s)/tot_plan_s) if tot_plan_s>0 else np.nan
+    desv_s = (tot_real_s - tot_plan_s)/tot_plan_s*100 if tot_plan_s>0 else np.nan
+    desv_m = (tot_real_m - tot_plan_m)/tot_plan_m*100 if tot_plan_m>0 else np.nan
+
+    rows = [
+        ["Indicador", "Valor"],
+        ["Efectividad de la planificación", f"{efect:.2%}" if pd.notna(efect) else "—"],
+        ["% Desvío Servicios (Real - Plan)", f"{desv_s:,.1f}%" if pd.notna(desv_s) else "—"],
+        ["% Desvío Móviles (Real - Plan)", f"{desv_m:,.1f}%" if pd.notna(desv_m) else "—"],
+        ["MAPE (Servicios)", f"{(df['APE'].mean()*100):.1f}%" if df['APE'].notna().any() else "—"],
+        ["MAE (Servicios)", f"{df['AE'].mean():.2f}" if df['AE'].notna().any() else "—"],
+        ["Forecast Bias (Servicios)", f"{(df['Bias'].sum()/df['Servicios_Reales'].sum()*100):.1f}%" if df['Servicios_Reales'].sum()!=0 else "—"],
+    ]
+    for i, row in enumerate(rows, start=1):
+        for j, val in enumerate(row, start=1):
+            c = ws_res.cell(row=i, column=j, value=val)
+            c.font = font_hdr if i==1 or j==1 else font_txt
+            c.fill = fill_hdr if i==1 or j==1 else fill_blk
+            c.alignment = Alignment(horizontal="left")
+            c.border = border
+
+    # Explicación
+    exp_txt = (
+        "Efectividad = 1 − |Real − Plan| / Plan (sobre Servicios).  "
+        "Desvío % = (Real − Plan) / Plan × 100.  "
+        "MAPE/MAE/Bias calculados sobre Servicios.  "
+        "Los valores están filtrados según la selección de la app."
+    )
+    ws_res.cell(row=len(rows)+2, column=1, value=exp_txt).font = font_txt
+
+    # --------- Datos ----------
+    # Escribo el df en la hoja "Datos"
+    cols = list(df.columns)
+    for j, c in enumerate(cols, start=1):
+        cell = ws_d.cell(row=1, column=j, value=c)
+        cell.font = font_hdr; cell.fill = fill_hdr; cell.border = border
+    for i, r in enumerate(df.itertuples(index=False), start=2):
+        for j, v in enumerate(r, start=1):
+            cell = ws_d.cell(row=i, column=j, value=v)
+            cell.font = font_txt; cell.fill = fill_blk; cell.border = border
+
+    # --------- Gráficos ----------
+    # Gráfico 1: Línea Plan vs Real (Servicios)
+    # Ubico series en columnas de "Datos"
+    def col_idx(name):
+        return cols.index(name)+1 if name in cols else None
+    x_col = col_idx("HoraStr")
+    y1    = col_idx("Servicios_Planificados")
+    y2    = col_idx("Servicios_Reales")
+    ydv   = col_idx("Dif_Servicios")
+
+    max_row = len(df)+1
+
+    if x_col and y1 and y2:
+        lc = LineChart()
+        lc.title = "Plan vs Real (Servicios por hora)"
+        lc.style = 12
+        data1 = Reference(ws_d, min_col=y1, min_row=1, max_row=max_row)  # incluye encabezado
+        data2 = Reference(ws_d, min_col=y2, min_row=1, max_row=max_row)
+        cats  = Reference(ws_d, min_col=x_col, min_row=2, max_row=max_row)
+        lc.add_data(data1, titles_from_data=True)
+        lc.add_data(data2, titles_from_data=True)
+        lc.set_categories(cats)
+        ws_g.add_chart(lc, "A2")
+
+    # Gráfico 2: Barras Desvío % por hora (Servicios)
+    if x_col and ydv:
+        bc = BarChart()
+        bc.title = "Desvío (Servicios) por hora — Real − Plan"
+        bc.style = 12
+        data3 = Reference(ws_d, min_col=ydv, min_row=1, max_row=max_row)
+        cats  = Reference(ws_d, min_col=x_col, min_row=2, max_row=max_row)
+        bc.add_data(data3, titles_from_data=True)
+        bc.set_categories(cats)
+        ws_g.add_chart(bc, "A20")
+
+    # Salida
+    bio = BytesIO()
+    wb.save(bio)
+    return bio.getvalue(), nombre
+
+# ==========================
+# Sidebar — Pegar Plan y Real
+# ==========================
 with st.sidebar:
-    st.header("Pegar Planificación y Realidad (sin Excel)")
-
+    st.header("Pegar datos — Planificación y Realidad (sin Excel)")
     bases_exist = sorted(st.session_state["bases"].keys())
     base_sel = st.selectbox("Base", options=["(nueva)"] + bases_exist, index=0)
-    base_name = st.text_input("Nombre de Base", value="" if base_sel=="(nueva)" else base_sel, help="Ej.: PROY_6001")
+    base_name = st.text_input("Nombre de Base", value="" if base_sel=="(nueva)" else base_sel, help="Ej.: PROY_6001 / DEMOTOS")
     fecha_in = st.date_input("Fecha", value=None)
 
-    st.caption("Pegá la tabla copiada desde Excel. Acepta TAB/;/,; decimales con coma o punto; y variaciones de encabezados.")
-    with st.expander("Planificación (contiene SVC PROY y/o MOV REQ)", expanded=True):
-        txt_plan = st.text_area("Pegar Planificación", height=180, key="paste_plan")
-    with st.expander("Realidad (contiene SVC REALES y/o MOVILES X NOMINA)", expanded=True):
-        txt_real = st.text_area("Pegar Realidad", height=180, key="paste_real")
+    st.caption("Pegá tablas copiadas desde Excel. Acepta TAB/;/,; decimales con coma o punto; encabezados variables o sin encabezado.")
+    with st.expander("Planificación (pegar tabla que contenga SVC PROY y/o MOV REQ)", expanded=True):
+        txt_plan = st.text_area("Pegar Planificación", height=170, key="paste_plan")
+    with st.expander("Realidad (pegar tabla que contenga SVC REALES y/o MOVILES X NÓMINA)", expanded=True):
+        txt_real = st.text_area("Pegar Realidad", height=170, key="paste_real")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("🔎 Previsualizar (fusionar Plan + Real)"):
+    b1, b2 = st.columns(2)
+    with b1:
+        if st.button("🔎 Previsualizar y fusionar"):
             if not base_name:
                 st.error("Ingresá nombre de Base."); st.stop()
             if not fecha_in:
                 st.error("Elegí la Fecha."); st.stop()
-
             try:
-                # Parseos independientes (soporta que uno solo ya traiga todo)
-                df_p = parse_pasted_generic(txt_plan) if txt_plan.strip() else pd.DataFrame()
-                df_r = parse_pasted_generic(txt_real) if txt_real.strip() else pd.DataFrame()
-                # Si alguno viene vacío, uso el otro; si ambos tienen info, hago merge
+                df_p = parse_pasted_flexible(txt_plan) if txt_plan.strip() else pd.DataFrame()
+                df_r = parse_pasted_flexible(txt_real) if txt_real.strip() else pd.DataFrame()
                 if df_p.empty and df_r.empty:
                     st.error("No hay datos en Plan ni en Real."); st.stop()
-                if df_p.empty:
-                    df_p = df_r.copy()
-                if df_r.empty:
-                    df_r = df_p.copy()
+                if df_p.empty: df_p = df_r.copy()
+                if df_r.empty: df_r = df_p.copy()
 
-                merged_hr = merge_plan_real_from_pastes(df_p, df_r)
-                prev = enrich_with_time_and_metrics(merged_hr, fecha_in, base_name)
+                fused = merge_plan_real(df_p, df_r)
+                prev = enrich_with_time_and_metrics(fused, fecha_in, base_name)
                 st.session_state["_preview"] = prev
                 st.success(f"Previsualización OK — filas: {len(prev)}")
                 st.dataframe(prev.head(24), use_container_width=True)
             except Exception as e:
                 st.error(f"No se pudo leer/fusionar: {e}")
 
-    with c2:
+    with b2:
         if st.button("💾 Guardar Base (día)"):
             if st.session_state["_preview"].empty:
-                st.info("Primero presioná 'Previsualizar'.")
+                st.info("Primero presioná 'Previsualizar y fusionar'.")
             else:
                 df_prev = st.session_state["bases"].get(base_name, pd.DataFrame())
-                # eliminar ese día para esa base (si existía) y agregar lo nuevo
                 if not df_prev.empty:
                     df_prev = df_prev[~df_prev["Fecha"].eq(pd.to_datetime(fecha_in).date())]
                     df_new = pd.concat([df_prev, st.session_state["_preview"]], ignore_index=True)
@@ -299,145 +463,121 @@ with st.sidebar:
                 st.success(f"Base '{base_name}' guardada ({len(df_new)} filas totales).")
 
     st.markdown("---")
-    c3, c4 = st.columns(2)
-    with c3:
+    c1, c2 = st.columns(2)
+    with c1:
         if st.button("💾 Guardar MERGED (/data)"):
-            # unir todas las bases guardadas
             dfs = [df.copy() for df in st.session_state["bases"].values() if not df.empty]
             merged = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
             st.session_state["merged"] = merged
             if not merged.empty:
-                save_csv(merged, MERGED_CSV)
-                st.success(f"MERGED guardado: {len(merged):,} filas.")
+                save_csv(merged, MERGED_CSV); st.success(f"MERGED guardado: {len(merged):,} filas.")
             else:
                 st.info("No hay datos para guardar.")
-    with c4:
+    with c2:
         if st.button("🧹 Limpiar memoria"):
             st.session_state["bases"] = {}
             st.session_state["merged"] = pd.DataFrame()
             st.session_state["_preview"] = pd.DataFrame()
             st.success("Memoria limpiada (no borra /data).")
 
-# =====================================
-# Contenido principal — Tabs + Filtros
-# =====================================
-st.title("Comparación — Planificación vs Realidad (pegado directo)")
-tabs = st.tabs(["Dashboard", "Análisis por Base", "Análisis Horario", "Auditoría Detallada", "Configuración"])
+# ==========================
+# Área principal — Tabs + Filtros
+# ==========================
+st.title("Análisis de Planificación vs Realidad (pegado directo)")
+tabs = st.tabs(["Tablero", "Análisis por Base", "Análisis Horario", "Auditoría Detallada"])
 
-# Dataset unificado (en vivo)
+# Dataset unificado (vivo)
 dfs_live = [df.copy() for df in st.session_state["bases"].values() if not df.empty]
 merged_live = pd.concat(dfs_live, ignore_index=True) if dfs_live else pd.DataFrame()
 st.session_state["merged"] = merged_live
 
-# Filtros globales
-flt = st.container()
-with flt:
-    c1,c2,c3,c4,c5 = st.columns([1.3,1,1,1.2,1.6])
+# Filtros
+fl = st.container()
+with fl:
+    c1,c2,c3,c4,c5,c6 = st.columns([1.4,1,1,1,1.2,1.6])
     with c1:
         bases_all = sorted(merged_live["Base"].unique().tolist()) if not merged_live.empty else []
-        bases_fil = st.multiselect("Bases", options=bases_all, default=bases_all)
+        bases_fil = st.multiselect("Base", options=bases_all, default=bases_all)
     with c2:
         fecha_fil = st.date_input("Día", value=None, key="dia_filter")
     with c3:
-        semana_fil = st.number_input("Semana ISO", value=0, step=1, min_value=0)
+        semana_fil = st.number_input("Semana (ISO)", value=0, step=1, min_value=0)
     with c4:
-        mes_fil = st.text_input("Mes (aaaa-mm)", value="")
+        anio_fil = st.number_input("Año", value=0, step=1, min_value=0)
     with c5:
+        mes_fil = st.number_input("Mes", value=0, step=1, min_value=0, help="1-12 (opcional).")
+    with c6:
         horas_all = sorted(merged_live["HoraStr"].unique().tolist()) if not merged_live.empty else []
-        horas_fil = st.multiselect("Horas (HH:MM)", options=horas_all, default=horas_all)
+        horas_fil = st.multiselect("Hora (HH:MM)", options=horas_all, default=horas_all)
 
-def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
+def apply_filters(df):
     d = df.copy()
     if bases_fil: d = d[d["Base"].isin(bases_fil)]
     if fecha_fil is not None: d = d[d["Fecha"].eq(pd.to_datetime(fecha_fil).date())]
     if semana_fil and semana_fil>0: d = d[d["Semana"].eq(int(semana_fil))]
-    if mes_fil:
-        try:
-            aa, mm = mes_fil.split("-"); aa=int(aa); mm=int(mm)
-            d = d[(d["Año"].eq(aa)) & (d["Mes"].eq(mm))]
-        except Exception:
-            pass
+    if anio_fil and anio_fil>0: d = d[d["Año"].eq(int(anio_fil))]
+    if mes_fil and mes_fil>0: d = d[d["Mes"].eq(int(mes_fil))]
     if horas_fil: d = d[d["HoraStr"].isin(horas_fil)]
     return d
 
-# =====================================
-# TAB 1 — Dashboard
-# =====================================
+# ==========================
+# TAB 1 — Tablero
+# ==========================
 with tabs[0]:
     df_f = apply_filters(merged_live)
     if df_f.empty:
-        st.info("Pegá y guardá datos en el lateral, y/o ajustá filtros.")
+        st.info("Pegá/guardá datos en el lateral y/o ajustá filtros.")
     else:
-        st.subheader("KPIs globales")
-        tot_plan_m = df_f["Moviles_Planificados"].sum()
-        tot_real_m = df_f["Moviles_Reales"].sum()
+        st.subheader("Indicadores generales")
         tot_plan_s = df_f["Servicios_Planificados"].sum()
         tot_real_s = df_f["Servicios_Reales"].sum()
+        tot_plan_m = df_f["Moviles_Planificados"].sum()
+        tot_real_m = df_f["Moviles_Reales"].sum()
 
-        desvio_m = (tot_real_m - tot_plan_m)/tot_plan_m*100 if tot_plan_m>0 else np.nan
         desvio_s = (tot_real_s - tot_plan_s)/tot_plan_s*100 if tot_plan_s>0 else np.nan
+        desvio_m = (tot_real_m - tot_plan_m)/tot_plan_m*100 if tot_plan_m>0 else np.nan
         efect    = 1 - (abs(tot_real_s - tot_plan_s)/tot_plan_s) if tot_plan_s>0 else np.nan
 
-        m1,m2,m3 = st.columns(3)
-        m1.metric("Móviles — % Desvío", f"{desvio_m:,.1f}%" if pd.notna(desvio_m) else "—")
-        m2.metric("Servicios — % Desvío", f"{desvio_s:,.1f}%" if pd.notna(desvio_s) else "—")
-        m3.metric("Efectividad", f"{efect:.1%}" if pd.notna(efect) else "—")
+        k1,k2,k3,k4 = st.columns(4)
+        k1.metric("Efectividad de la planificación", f"{efect:.1%}" if pd.notna(efect) else "—")
+        k2.metric("Desvío Servicios (%)", f"{desvio_s:,.1f}%" if pd.notna(desvio_s) else "—")
+        k3.metric("Desvío Móviles (%)", f"{desvio_m:,.1f}%" if pd.notna(desvio_m) else "—")
+        k4.metric("Sesgo (Bias) Servicios (%)",
+                  f"{(df_f['Bias'].sum()/df_f['Servicios_Reales'].sum()*100):.1f}%" if df_f["Servicios_Reales"].sum()!=0 else "—")
 
-        # Semáforo
-        if pd.isna(efect): color, txt = ("#6B7280", "Sin datos")
-        elif efect >= 0.92: color, txt = ("#059669", "OK (≥ 92%)")
-        elif efect >= 0.89: color, txt = ("#F59E0B", "Atención (89–92%)")
-        else: color, txt = ("#DC2626", "Crítico (< 89%)")
-        st.markdown(f"**Estado general:** <span style='color:{color}'>{txt}</span>", unsafe_allow_html=True)
+        # Gráfico 1: Diferencia de Servicios por hora
+        g1 = df_f.groupby("HoraStr", as_index=False)[["Servicios_Planificados","Servicios_Reales","Dif_Servicios"]].sum()
+        fig1 = px.bar(g1, x="HoraStr", y="Dif_Servicios", color="Dif_Servicios",
+                      color_continuous_scale="RdYlGn", title="Desvío de Servicios por hora (Real − Plan)")
+        stylize(fig1); st.plotly_chart(fig1, use_container_width=True)
 
-        # Serie Plan vs Real (Servicios)
-        g = df_f.groupby(["Fecha","HoraStr"], as_index=False)[["Servicios_Planificados","Servicios_Reales"]].sum()
-        fig1 = px.line(g, x="HoraStr", y=["Servicios_Planificados","Servicios_Reales"],
-                       color_discrete_sequence=["#22D3EE","#10B981"])
-        stylize(fig1, "Plan vs Real (Servicios por hora)")
-        st.plotly_chart(fig1, use_container_width=True)
+        # Gráfico 2: Diferencia de Móviles por hora
+        g2 = df_f.groupby("HoraStr", as_index=False)[["Moviles_Planificados","Moviles_Reales","Dif_Moviles"]].sum()
+        fig2 = px.bar(g2, x="HoraStr", y="Dif_Moviles", color="Dif_Moviles",
+                      color_continuous_scale="RdYlGn", title="Desvío de Móviles por hora (Real − Plan)")
+        stylize(fig2); st.plotly_chart(fig2, use_container_width=True)
 
-        # Barras Desvío %
-        g2 = df_f.groupby("HoraStr", as_index=False)["Dif_Servicios"].sum()
-        g2p = df_f.groupby("HoraStr", as_index=False)["Servicios_Planificados"].sum()
-        g2 = g2.merge(g2p, on="HoraStr", how="left")
-        g2["Desvio_%"] = np.where(g2["Servicios_Planificados"]>0, g2["Dif_Servicios"]/g2["Servicios_Planificados"]*100, np.nan)
-        fig2 = px.bar(g2, x="HoraStr", y="Desvio_%", color="Desvio_%", color_continuous_scale="RdYlGn")
-        stylize(fig2, "Desvío % por hora (Servicios)")
-        st.plotly_chart(fig2, use_container_width=True)
-
-        # Heatmap
+        # Mapa de calor (Servicios)
         piv = df_f.pivot_table(values="Dif_Servicios", index="Fecha", columns="HoraStr", aggfunc="sum").fillna(0)
         if not piv.empty:
-            fig3 = px.imshow(piv, color_continuous_scale="RdYlGn", aspect="auto")
-            stylize(fig3, "Heatmap — Desvío de servicios (Real - Plan)")
-            st.plotly_chart(fig3, use_container_width=True)
+            fig3 = px.imshow(piv, color_continuous_scale="RdYlGn", aspect="auto",
+                             title="Mapa de calor — Desvío de servicios (Real − Plan)")
+            stylize(fig3); st.plotly_chart(fig3, use_container_width=True)
 
-        # Errores agregados
-        m = {
-            "MAPE_%": (df_f["APE"].mean()*100 if df_f["APE"].notna().any() else np.nan),
-            "MAE":    (df_f["AE"].mean() if df_f["AE"].notna().any() else np.nan),
-            "ForecastBias_%": ((df_f["Bias"].sum()/df_f["Servicios_Reales"].sum()*100) if df_f["Servicios_Reales"].sum()!=0 else np.nan)
-        }
-        st.markdown(f"**MAPE:** {m['MAPE_%']:.1f}% · **MAE:** {m['MAE']:.2f} · **Forecast Bias:** {m['ForecastBias_%']:.1f}%")
-
-        # Detección
-        g3 = df_f.groupby("HoraStr", as_index=False)["Dif_Servicios"].sum()
-        sub = g3.nsmallest(5, "Dif_Servicios")
-        sobre = g3.nlargest(5, "Dif_Servicios")
-        wb = df_f.groupby("Base", as_index=False)["Dif_Servicios"].apply(lambda s: s.abs().sum()).rename(columns={"Dif_Servicios":"AbsDesvio"}) \
-                 .sort_values("AbsDesvio", ascending=False).head(1)
+        # Top‑5 y Base con mayor desvío
+        hsum = df_f.groupby("HoraStr", as_index=False)["Dif_Servicios"].sum()
+        sub  = hsum.nsmallest(5, "Dif_Servicios")
+        sobre= hsum.nlargest(5, "Dif_Servicios")
+        wb   = df_f.groupby("Base", as_index=False)["Dif_Servicios"].apply(lambda s: s.abs().sum()) \
+                   .rename(columns={"Dif_Servicios":"Desvío absoluto"}).sort_values("Desvío absoluto", ascending=False).head(1)
         c1,c2,c3 = st.columns(3)
-        with c1:
-            st.subheader("Top 5 Sub‑plan (horas)"); st.dataframe(sub, use_container_width=True, hide_index=True)
-        with c2:
-            st.subheader("Top 5 Sobre‑plan (horas)"); st.dataframe(sobre, use_container_width=True, hide_index=True)
-        with c3:
-            st.subheader("Base con mayor desvío");   st.dataframe(wb, use_container_width=True, hide_index=True)
+        with c1: st.subheader("Top 5 Sub‑plan (Servicios)"); st.dataframe(sub, use_container_width=True, hide_index=True)
+        with c2: st.subheader("Top 5 Sobre‑plan (Servicios)"); st.dataframe(sobre, use_container_width=True, hide_index=True)
+        with c3: st.subheader("Base con mayor desvío"); st.dataframe(wb, use_container_width=True, hide_index=True)
 
-# =====================================
+# ==========================
 # TAB 2 — Análisis por Base
-# =====================================
+# ==========================
 with tabs[1]:
     df_f = apply_filters(merged_live)
     if df_f.empty:
@@ -445,85 +585,55 @@ with tabs[1]:
     else:
         st.subheader("Desvío por Base (Servicios)")
         g = df_f.groupby("Base", as_index=False)[["Servicios_Planificados","Servicios_Reales"]].sum()
-        g["Desvio_%"] = np.where(g["Servicios_Planificados"]>0,
+        g["Desvío_%"] = np.where(g["Servicios_Planificados"]>0,
                                  (g["Servicios_Reales"]-g["Servicios_Planificados"])/g["Servicios_Planificados"]*100, np.nan)
-        fig = px.bar(g, x="Base", y="Desvio_%", color="Desvio_%", color_continuous_scale="RdYlGn")
-        stylize(fig, "Desvío % por Base")
-        st.plotly_chart(fig, use_container_width=True)
+        fig = px.bar(g, x="Base", y="Desvío_%", color="Desvío_%", color_continuous_scale="RdYlGn",
+                     title="Desvío % por Base (Servicios)")
+        stylize(fig); st.plotly_chart(fig, use_container_width=True)
         st.dataframe(g, use_container_width=True, hide_index=True)
 
-# =====================================
+# ==========================
 # TAB 3 — Análisis Horario
-# =====================================
+# ==========================
 with tabs[2]:
     df_f = apply_filters(merged_live)
     if df_f.empty:
         st.info("No hay datos para los filtros seleccionados.")
     else:
-        st.subheader("Series por hora — Plan vs Real (Servicios)")
-        g = df_f.groupby("HoraStr", as_index=False)[["Servicios_Planificados","Servicios_Reales"]].sum()
-        fig = px.line(g, x="HoraStr", y=["Servicios_Planificados","Servicios_Reales"],
-                      color_discrete_sequence=["#22D3EE","#10B981"])
-        stylize(fig, "Plan vs Real por hora")
-        st.plotly_chart(fig, use_container_width=True)
+        st.subheader("Series por hora — Plan vs Real")
+        g = df_f.groupby("HoraStr", as_index=False)[["Servicios_Planificados","Servicios_Reales",
+                                                     "Moviles_Planificados","Moviles_Reales"]].sum()
+        fig = px.line(g, x="HoraStr", y=["Servicios_Planificados","Servicios_Reales"], title="Servicios — Plan vs Real")
+        stylize(fig); st.plotly_chart(fig, use_container_width=True)
+        figm = px.line(g, x="HoraStr", y=["Moviles_Planificados","Moviles_Reales"], title="Móviles — Plan vs Real")
+        stylize(figm); st.plotly_chart(figm, use_container_width=True)
 
-        st.subheader("Desvío (Servicios)")
-        g2 = df_f.groupby("HoraStr", as_index=False)["Dif_Servicios"].sum()
-        fig2 = px.bar(g2, x="HoraStr", y="Dif_Servicios", color="Dif_Servicios", color_continuous_scale="RdYlGn")
-        stylize(fig2, "Desvío (Real - Plan) por hora")
-        st.plotly_chart(fig2, use_container_width=True)
-
+        st.subheader("Tabla horaria (detalle)")
         st.dataframe(
-            df_f[["Fecha","HoraStr","Base","Servicios_Planificados","Servicios_Reales",
-                  "Dif_Servicios","Desvio_Servicios_%","Clasificacion"]].sort_values(["Fecha","HoraStr","Base"]),
+            df_f[["Fecha","HoraStr","Base","Servicios_Planificados","Servicios_Reales","Dif_Servicios",
+                  "Moviles_Planificados","Moviles_Reales","Dif_Moviles","Efectividad","Clasificacion"]]
+            .sort_values(["Fecha","HoraStr","Base"]),
             use_container_width=True, hide_index=True
         )
 
-# =====================================
-# TAB 4 — Auditoría Detallada (con descarga)
-# =====================================
+# ==========================
+# TAB 4 — Auditoría Detallada (descarga Excel lindo)
+# ==========================
 with tabs[3]:
     df_f = apply_filters(merged_live)
     if df_f.empty:
         st.info("No hay datos para los filtros seleccionados.")
     else:
-        st.subheader("Auditoría (lo que ves)")
+        st.subheader("Auditoría (lo que estás viendo)")
         cols = ["Fecha","HoraStr","Base",
-                "Moviles_Planificados","Moviles_Reales","Dif_Moviles","Desvio_Moviles_%",
                 "Servicios_Planificados","Servicios_Reales","Dif_Servicios","Desvio_Servicios_%",
+                "Moviles_Planificados","Moviles_Reales","Dif_Moviles","Desvio_Moviles_%",
                 "Efectividad","Clasificacion","Status","Semana","Mes","Año","Coeficiente_HS"]
         cols = [c for c in cols if c in df_f.columns]
         df_aud = df_f[cols].sort_values(["Fecha","HoraStr","Base"])
+
         st.dataframe(df_aud, use_container_width=True, hide_index=True)
-
-        xls, name = to_excel_bytes(df_aud, sheet="auditoria", name="auditoria_plan_vs_real.xlsx")
-        st.download_button("⬇️ Descargar Excel (auditoría)", data=xls, file_name=name,
+        # Excel enriquecido (KPIs + 2 gráficos + datos)
+        xls, fname = export_excel_pretty(df_aud, "analisis_plan_vs_real.xlsx")
+        st.download_button("⬇️ Descargar Excel enriquecido", data=xls, file_name=fname,
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-# =====================================
-# TAB 5 — Configuración (opcional, para ver/recuperar guardados)
-# =====================================
-with tabs[4]:
-    st.subheader("Configuración y persistencia")
-    st.write("Directorios:", str(DATA_DIR), " / ", str(BASES_DIR))
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("📥 Cargar MERGED desde /data"):
-            m = load_csv(MERGED_CSV)
-            if m is not None:
-                st.session_state["merged"] = m
-                st.success(f"MERGED cargado: {len(m):,} filas.")
-            else:
-                st.info("No existe /data/merged.csv todavía.")
-    with c2:
-        if st.button("📥 Cargar todas las bases desde /data/bases"):
-            loaded = 0
-            for p in BASES_DIR.glob("*.csv"):
-                try:
-                    dfb = load_csv(p)
-                    if dfb is not None:
-                        st.session_state["bases"][p.stem] = dfb
-                        loaded += 1
-                except Exception:
-                    pass
-            st.success(f"Bases cargadas: {loaded}")
